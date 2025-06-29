@@ -116,7 +116,7 @@ public:
    * DEALINGS IN THE SOFTWARE.
    */
 
-  uint32_t operator() (uint32_t range) {
+  virtual uint32_t operator() (uint32_t range) {
     uint32_t x = this->bit32();
     uint64_t m = uint64_t(x) * uint64_t(range);
     uint32_t l = uint32_t(m);
@@ -137,7 +137,7 @@ public:
   }
 
 #ifdef LONG_VECTOR_SUPPORT
-  uint64_t operator() (uint64_t range) {
+  virtual uint64_t operator() (uint64_t range) {
     using pcg_extras::pcg128_t;
     uint64_t x = this->bit64();
     pcg128_t m = pcg128_t(x) * pcg128_t(range);
@@ -279,6 +279,16 @@ public:
   virtual result_type operator() () override {
     return (*gen)();
   };
+
+  virtual uint32_t operator() (uint32_t range) override {
+    return (*gen)(range);
+  }
+
+#ifdef LONG_VECTOR_SUPPORT
+  virtual uint64_t operator() (uint64_t range) override {
+    return (*gen)(range);
+  }
+#endif
 
   virtual void seed(result_type seed) override {
     throw std::runtime_error("Seed handling not supported for this class!");

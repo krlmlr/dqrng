@@ -31,7 +31,7 @@ License: AGPL-3
 Depends: R (>= 3.5.0)
 Imports: Rcpp (>= 0.12.16)
 LinkingTo: Rcpp, BH (>= 1.64.0-1), sitmo (>= 2.0.0)
-RoxygenNote: 7.3.1
+RoxygenNote: 7.3.2
 Suggests:
     BH,
     testthat,

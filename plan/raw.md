@@ -43,7 +43,7 @@ The user-facing argument therefore today is one of:
    should also accept **4** (32 bits) for parity with the
    integer-scalar shortcut, so the two existing input shapes map
    cleanly to two raw shapes. Larger lengths are out of scope for now
-   (see §6).
+   (see §7).
 2. **Reading (output).** `generateSeedVectors()` should be able to
    return `raw` vectors instead of integer vectors. The format is
    controlled by:
@@ -54,6 +54,78 @@ The user-facing argument therefore today is one of:
 3. Round-trip: a value returned with `format = "raw"` must be accepted
    as-is by `dqset.seed()` / `dqset_seed()` / `clone()` without manual
    conversion.
+
+## 2a. Byte / bit layout (MSB-first)
+
+The current integer-vector convention is **MSB-first**: the first
+element holds the most significant bits. The raw-vector convention
+will be the same: byte 1 is the most significant byte, byte 8 the
+least significant. This matches `writeBin(..., endian = "big")` and
+matches `dqrng::convert_seed_internal` (`inst/include/convert_seed.h`),
+which shifts left as it consumes each element.
+
+Worked example — same 64-bit value `0x0011223344556677` in three
+representations:
+
+```
+R integer(2)  (current API):
+
+  stream <- c(0x00112233L, 0x44556677L)
+                  │             │
+                  │             └──── stream[2] = low  32 bits
+                  └────────────────── stream[1] = high 32 bits
+
+  bit positions:  63        32 31         0
+                  ▼          ▼ ▼          ▼
+                  ┌──────────┐ ┌──────────┐
+                  │00112233  │ │44556677  │
+                  └──────────┘ └──────────┘
+                  ↑ MSB                  ↑ LSB
+
+R raw(8)  (proposed API):
+
+  stream <- as.raw(c(0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77))
+                     │                                          │
+                     stream[1]                                  stream[8]
+                     = high byte                                = low byte
+
+  byte index:    [1]  [2]  [3]  [4]  [5]  [6]  [7]  [8]
+                 ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐
+  value:         │00│ │11│ │22│ │33│ │44│ │55│ │66│ │77│
+                 └──┘ └──┘ └──┘ └──┘ └──┘ └──┘ └──┘ └──┘
+  bit range:     63.56 55.48 47.40 39.32 31.24 23.16 15.8 7..0
+                 ↑ MSB                                     ↑ LSB
+
+C++ uint64_t  (what the RNG actually sees):
+
+  bit position:   63                                              0
+                  ▼                                               ▼
+                  0x  00   11   22   33   44   55   66   77
+                       ↑                                       ↑
+                       most significant                        least significant
+```
+
+Cross-check against R built-ins:
+
+```r
+writeBin(0x0011223344556677, raw(), size = 8, endian = "big")
+#> [1] 00 11 22 33 44 55 66 77   ← matches the raw(8) above
+
+# Length-4 raw / length-1 integer carry 32 bits, padded with
+# zero in the high half:
+stream4 <- as.raw(c(0x44, 0x55, 0x66, 0x77))
+# equivalent to integer scalar 0x44556677L
+# packs to uint64_t 0x0000000044556677
+```
+
+The bit at index `k` of the raw vector lives at C++ bit position
+`8*(N-i) + (7-j)` for byte `i ∈ {1..N}`, bit-within-byte `j ∈ {0..7}`.
+No host-endianness dependency: bytes are written into the `uint64_t`
+in the order they appear in the R vector, via repeated `(sum << 8) |
+byte` in `convert_seed_internal`.
+
+We commit to MSB-first / big-endian only. `endian = "little"` is
+explicitly **not** supported (see §7).
 
 ## 3. Design
 
@@ -98,45 +170,71 @@ to prove parity.
 
 ### 3.2 C++ layer — `dqset_seed`
 
-`src/dqrng.cpp:36` currently uses `Rcpp::Nullable<Rcpp::IntegerVector>`
-for both `seed` and `stream`. Loosen to `SEXP` (or `Rcpp::RObject`) and
-dispatch on `TYPEOF`:
+**ABI constraint.** `src/dqrng.cpp` is under
+`// [[Rcpp::interfaces(r, cpp)]]` (line 33), so every exported function
+is published into `inst/include/dqrng_RcppExports.h` as a free function
+with a baked-in `validateSignature()` string. For `dqset_seed`:
 
 ```cpp
-// pseudocode
-static uint64_t coerce_seed_like(SEXP x, const char* what) {
-    if (Rf_isNull(x)) Rcpp::stop("internal: null where value required");
-    switch (TYPEOF(x)) {
-    case INTSXP:
-        return dqrng::convert_seed<uint64_t>(Rcpp::IntegerVector(x));
-    case RAWSXP:
-        return dqrng::convert_seed<uint64_t>(Rcpp::RawVector(x));
-    default:
-        Rcpp::stop("`%s` must be integer or raw", what);
-    }
-}
+// inst/include/dqrng_RcppExports.h:32
+validateSignature("void(*dqset_seed)(Rcpp::Nullable<Rcpp::IntegerVector>,
+                                     Rcpp::Nullable<Rcpp::IntegerVector>)");
 ```
 
-Then in `dqset_seed`:
+Downstream packages that already link against `dqrng` have this string
+compiled into their binary. If we change `dqset_seed`'s parameter
+types in `src/dqrng.cpp`, the registered signature also changes, and
+`validateSignature` throws at *their* load time — i.e. silent C++ ABI
+break. The same applies to `dqRNGkind`, `dqrng_get_state`,
+`dqrng_set_state`, `dqrunif`, `dqrnorm`, `dqrexp`, `dqrrademacher`.
+
+So we do **not** change any existing exported signature. We add a
+sibling export and dispatch on the R side:
 
 ```cpp
-void dqset_seed(SEXP seed, SEXP stream = R_NilValue) {
-  if (Rf_isNull(seed)) {
+// src/dqrng.cpp — new export, leaves dqset_seed() untouched
+// [[Rcpp::export(rng = false)]]
+void dqset_seed_raw(Rcpp::Nullable<Rcpp::RawVector> seed,
+                    Rcpp::Nullable<Rcpp::RawVector> stream = R_NilValue) {
+  if (seed.isNull()) {
     rng = dqrng::generator();
     return;
   }
-  uint64_t _seed = coerce_seed_like(seed, "seed");
-  if (Rf_isNull(stream)) {
-    rng->seed(_seed);
+  uint64_t _seed = dqrng::convert_seed<uint64_t>(seed.as());
+  if (stream.isNotNull()) {
+    rng->seed(_seed, dqrng::convert_seed<uint64_t>(stream.as()));
   } else {
-    rng->seed(_seed, coerce_seed_like(stream, "stream"));
+    rng->seed(_seed);
   }
 }
 ```
 
-This keeps the existing wire signature backwards compatible (Rcpp
-attribute regenerates `RcppExports.R` — verify the resulting R-side
-function still accepts `NULL`, `integer`, and now `raw`).
+The existing `dqset_seed(Nullable<IntegerVector>, Nullable<IntegerVector>)`
+stays bit-for-bit identical so its `validateSignature` string is
+unchanged.
+
+R-side dispatch happens in `dqset.seed()`:
+
+```r
+dqset.seed <- function(seed, stream = NULL) {
+  if (is.raw(seed) || is.raw(stream)) {
+    dqset_seed_raw(if (is.null(seed)) NULL else as.raw(seed),
+                   if (is.null(stream)) NULL else as.raw(stream))
+  } else {
+    dqset_seed(seed, stream)
+  }
+}
+```
+
+Mixed inputs (e.g. integer `seed` + raw `stream`) are normalised at the
+R level — convert the integer side to its raw form before calling
+`dqset_seed_raw`, so the C++ entry point only ever sees a single type
+per argument. Keeps the C++ surface small and the dispatch obvious.
+
+Note that `dqset_seed_raw` is intentionally **also** added to the
+`r, cpp` interface — downstream C++ packages will then be able to
+seed dqrng directly from a raw vector after a rebuild against the new
+dqrng, without losing the ability to use the old integer entry point.
 
 ### 3.3 R layer
 
@@ -206,19 +304,29 @@ TYPEOF-switch in `dqset_seed`.
 ### 3.7 Header-level API (`clone`, `seed`)
 
 `random_64bit_generator::clone(uint64_t stream)` and
-`seed(uint64_t, uint64_t)` stay numeric — exporting raw vectors
-through the C++ ABI would force every consumer to depend on Rcpp.
-Instead, leave the C++ ABI numeric and provide a free helper for
-package authors who want to accept raw vectors at their own R surface:
+`seed(uint64_t, uint64_t)` stay numeric. They are virtual methods on
+the abstract base in `inst/include/dqrng_types.h`; changing their
+signatures (even by overloading) would shift the vtable and break
+binary compatibility with any downstream package that has a compiled
+subclass. The path for raw input is purely additive at the
+`convert_seed` overload level (§3.1): downstream code calls
+`dqrng::convert_seed<uint64_t>(raw_vec)` and then passes the
+`uint64_t` into the existing virtual.
+
+For convenience, expose one free function in
+`inst/include/convert_seed.h`:
 
 ```cpp
 namespace dqrng {
-inline uint64_t as_uint64_seed(SEXP x);   // dispatch on TYPEOF
+// dispatch helper for downstream R-facing wrappers; pure addition,
+// no ABI impact.
+inline uint64_t as_uint64_seed(SEXP x);   // INTSXP -> existing path,
+                                          // RAWSXP -> new overload,
+                                          // NILSXP -> caller's problem
 }
 ```
 
-This goes in `inst/include/convert_seed.h` and is the recommended
-ingestion path for downstream packages.
+Inline + new symbol ⇒ ABI-safe.
 
 ## 4. Tests
 
@@ -259,7 +367,62 @@ In `tests/testthat/`:
   intro vignette would read more naturally with `raw(8)` stream IDs;
   consider a one-line aside.
 
-## 6. Out of scope (follow-ups)
+## 6. Every R↔C++ multi-byte channel — touch in one swoop?
+
+Below: every place the dqrng R API moves a value that is conceptually
+more than one byte across the R/C++ boundary, with the verdict on
+whether it can be `raw`-ified without breaking the C++ ABI (defined
+here as: existing downstream packages keep working without
+recompilation, i.e. no `validateSignature` mismatch in
+`dqrng_RcppExports.h`, no virtual-method or class-layout change in
+`dqrng_types.h`, no change to existing `dqrng::convert_seed`
+overloads, no change to `random_64bit_generator::seed/clone/output/
+input`).
+
+| # | Channel | Direction | Type today | ABI-safe `raw` path? | In this swoop? |
+|---|---|---|---|---|---|
+| 1 | `dqset.seed(seed = ...)` | in | `IntegerVector` (length 1 or 2) | yes — add `dqset_seed_raw` (§3.2), R-side dispatch | **yes** |
+| 2 | `dqset.seed(stream = ...)` | in | `IntegerVector` (length 1 or 2) | yes — same sibling export | **yes** |
+| 3 | `generateSeedVectors()` | out | `list<IntegerVector>` of length-`nwords` | yes — not in `r,cpp` interface (R-only export), free to add `format = "raw"` | **yes** |
+| 4 | `dqrng_get_state()` | out | `character` (RNG-kind string + decimal words) | no — see §6.1 | no, follow-up |
+| 5 | `dqrng_set_state(state)` | in | `character` (same encoding) | no — mirror of (4) | no, follow-up |
+| 6 | C++ API: `clone(uint64_t stream)` | in (C++ only) | numeric | n/a — not an R-side channel; raw input is converted in R/RcppExports glue before reaching here | stays numeric |
+| 7 | C++ API: `seed(uint64_t, uint64_t)` virtuals | in (C++ only) | numeric | n/a — same | stays numeric |
+| 8 | RNG output (`(*rng)()`, `dqrunif`, etc.) | out | `double` / `integer` | n/a — distribution-shaped output, not a byte channel | no |
+
+### 6.1 Why state get/set is not ABI-safe today
+
+The current state serialisation runs through
+`random_64bit_generator::output(std::ostream&)` /
+`input(std::istream&)` (`inst/include/dqrng_types.h:66-67`), and the
+result is reassembled into a `character` vector by `dqrng_get_state`.
+The format is RNG-specific (decimal-formatted words: 2 for
+xoroshiro128, 4 for xoshiro256, mixed 128-bit values for PCG64,
+arrays for threefry).
+
+Two non-options:
+
+1. **Convert the existing text to bytes on the R side** (e.g.
+   `charToRaw(paste(state, collapse = " "))`). That gives ASCII bytes,
+   not a binary representation of the state — useless for compactness
+   or for tools that want fixed-width state.
+2. **Add new virtuals** `to_raw()` / `from_raw()` to
+   `random_64bit_generator`. Adding a virtual method shifts the vtable
+   layout for any downstream subclass compiled against the old header
+   — classic C++ ABI break, even if no user code calls the new
+   method.
+
+A genuinely ABI-safe path would be to *additionally* register a new
+free-function export (e.g. `dqrng_get_state_raw()`) that **internally**
+performs an `rng_kind`-switched downcast — `Rcpp::XPtr` ->
+`random_64bit_wrapper<RNG>*` for each known RNG — and reads its
+internal state via the concrete type. This works without touching
+`dqrng_types.h`, but it bakes the set of recognised RNGs into the
+C++ dispatch, and the round-trip semantics need careful design
+(versioned format header, length-per-RNG table). It is a meaningful
+amount of work; not in scope here.
+
+### 6.2 Things explicitly out of scope
 
 - Lengths > 8 / multi-word stream IDs. Today the abstract API
   flattens both `seed` and `stream` to `uint64_t`. Supporting
@@ -271,21 +434,31 @@ In `tests/testthat/`:
 - Endianness flag. We commit to MSB-first (matches the current
   integer convention and `convert_seed_internal`). If LSB-first is
   ever wanted, add `endian = c("big", "little")` then.
-- Raw output from `dqrng_get_state()`. The state is a free-form
-  text serialisation today; converting it to raw is a bigger
-  redesign, unrelated to stream IDs.
+- Raw form of `dqrng_get_state()` / `dqrng_set_state()`. See §6.1.
+- Returning the auto-generated seed from `dqset.seed(NULL)` so it
+  can be recorded for replay. Tempting (and the `raw(8)` format
+  would be the natural carrier), but it's an independent feature —
+  log it as a separate issue.
 
 ## 7. Work breakdown
 
-1. C++: add `RawVector` overloads in `convert_seed.h` + `as_uint64_seed`
-   helper. Tests in `tests/testthat/cpp/convert.cpp`.
-2. C++: switch `dqset_seed` signature to `SEXP` with TYPEOF dispatch.
-   Regenerate `RcppExports.{R,cpp}`. Existing tests must still pass.
-3. R: update `dqset.seed()` roxygen; add raw-input tests.
+1. C++: add `RawVector` overloads in `convert_seed.h` + inline
+   `as_uint64_seed(SEXP)` helper. Tests in
+   `tests/testthat/cpp/convert.cpp`. (Pure addition — `dqrng_RcppExports.h`
+   unaffected.)
+2. C++: add `dqset_seed_raw(Nullable<RawVector>, Nullable<RawVector>)`
+   alongside (not replacing) `dqset_seed`. Regenerate
+   `RcppExports.{R,cpp}` and verify the existing `dqset_seed`
+   signature string in `dqrng_RcppExports.h` is byte-for-byte
+   unchanged.
+3. R: `dqset.seed()` gains type-dispatch (integer path → `dqset_seed`,
+   raw path → `dqset_seed_raw`, mixed → normalise to raw). Update
+   roxygen and examples. Add raw-input tests.
 4. C++/R: parameterise `generateSeedVectors()` with `format`; add R
-   wrapper that reads `dqrng.seed_format`. Tests for both formats and
-   round-trip.
-5. Docs: NEWS.md entry; man pages regenerated via `devtools::document()`;
-   `air` format pass.
-6. Optional: tiny vignette tweak demonstrating `raw(8)` streams in the
-   `clusterApply` example.
+   wrapper that reads `dqrng.seed_format`. (Safe to change signature
+   — not in `r,cpp` interface.) Tests for both formats and round-trip.
+5. Docs: NEWS.md entry calling out the additive nature (no rebuild
+   required for downstream packages); man pages regenerated via
+   `devtools::document()`; `air` format pass.
+6. Optional: tiny vignette tweak demonstrating `raw(8)` streams in
+   the `clusterApply` example.

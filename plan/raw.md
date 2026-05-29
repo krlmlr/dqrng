@@ -1,70 +1,83 @@
-# Consistent `raw`-based seed / stream / state API
+# `dqrng2`: a clean, experimental sister package
 
 Status: design draft, not started.
-Replaces the earlier "add raw input" sketch.
-Two parts: (A) R-level API cleanup, (B) C++ API/ABI redesign from
-scratch. (A) is value on its own and can ship without (B). (B) makes
-(A) cheap to implement and removes the conventions that make the
-current code painful.
+Replaces the in-place redesign sketches.
+Outcome: a new R package `dqrng2`, parallel to `dqrng`, with a clean R
+and C++ interface from day one. Marked experimental.
+Changes are ported back to `dqrng` step by step, at the maintainer's
+pace, one mergeable PR per idea.
 
-## 1. Problem
+## 1. Why a separate package
 
-dqrng's R API moves "key material" — seeds, stream selectors, RNG
-state, generated seed pools — across four channels, and each channel
-uses a *different* R shape for what is conceptually a fixed-width
-byte string:
+Three things make in-place evolution of `dqrng` painful:
 
-| Conceptual value | R shape today | How bits map |
-|---|---|---|
-| 64-bit seed / stream | `integer(1)` *or* `integer(2)` | bit-packed, MSB-first, 32 bits/word |
-| RNG state | `character` vector | first element = kind tag, rest = decimal-encoded 64-bit (or 128-bit, for PCG64) words, space-split by `dqrng_get_state` |
-| Generated seed pool | `list<integer(nwords)>` | same bit-packing as seed, `nwords` chosen by caller |
-| Auto-generated seed (when `dqset.seed(NULL)`) | none — pulled from R's RNG and silently discarded | n/a |
+1. **C++ ABI surface.** `src/dqrng.cpp` is `// [[Rcpp::interfaces(r,
+   cpp)]]`, so every exported function's signature is baked into
+   `inst/include/dqrng_RcppExports.h` and `validateSignature`-checked
+   inside compiled downstream packages. Any rename or signature
+   change breaks them at load time. The reverse-dependency surface
+   on CRAN is non-trivial.
+2. **Public C++ types.** `random_64bit_generator`,
+   `dqrng::convert_seed<T>`, `dqrng::rng64_t` are baked into
+   downstream code. Widening or replacing them is an ABI break for
+   every subclass, every includer.
+3. **Maintainer bandwidth.** The current maintainer is upstream of
+   us. Forcing a big-bang rewrite onto their queue is rude and slow.
 
-The result:
+A separate package, `dqrng2`, sidesteps all three:
 
-- **Same value, two shapes.** `dqset.seed(42L)` and
-  `dqset.seed(c(0L, 42L))` are the same uint64; the caller has to
-  remember the MSB-first 32-bit-per-word convention to round-trip a
-  64-bit value through `integer(2)`.
-- **State is a string.** `dqrng_get_state()` returns
-  `c("xoroshiro128++", "12345", "67890")` — a tag plus
-  decimal-encoded internal state, RNG-kind dependent length, parsing
-  done with `std::stringstream` (`src/dqrng.cpp:84-100`). Anyone who
-  wants to hash, store, or transport state has to defensively
-  preserve a `character` vector.
-- **Seed pool comes as ints.** `generateSeedVectors()` returns
-  `list<integer(nwords)>` and the user has to keep the same
-  packing convention straight on the way back into `dqset.seed()`.
-- **Auto-seed disappears.** When `seed = NULL`, the seed pulled from
-  R's RNG is consumed inside `dqset_seed` and never surfaced.
-  Replay requires the user to draw their own seed.
+- No `validateSignature` constraints — nobody links against `dqrng2`
+  yet.
+- Free to pick whatever C++ types make sense.
+- Each clean idea becomes a small, self-contained PR for `dqrng`
+  that the maintainer can take or leave. `dqrng2` is the proving
+  ground; `dqrng` adopts only what survives.
 
-Adding "accept `raw` too" everywhere makes the surface bigger, not
-cleaner. The fix is to pick one canonical shape and use it
-everywhere — and to give downstream a single byte-oriented C++ API
-that the R glue is a thin wrapper over.
+`dqrng2` is **not** a fork. It does not aim to replace `dqrng`. It is
+a sandbox for the API we wish `dqrng` had, plus a porting source.
 
-## 2. Two canonical shapes
+## 2. Scope
 
-The R API should carry key material in exactly two shapes:
+`dqrng2` ships with:
 
-1. **`raw(N)`** — a self-contained, fixed-width binary value. Used
-   for seeds, stream selectors, and generated seed pools.
+- The same set of RNGs as `dqrng`: xoroshiro128+/++/\*\*,
+  xoshiro256+/++/\*\*, PCG64, Threefry-20-64.
+- The same set of distributions: uniform, normal (Ziggurat),
+  exponential (Ziggurat), Rademacher.
+- Sampling: weighted/unweighted with/without replacement.
+- A consistent R API built on two canonical shapes (§4).
+- A clean C++ API in namespace `dqrng2` (§7), header-only enough
+  for `LinkingTo: dqrng2` from day one.
+
+`dqrng2` does **not**:
+
+- Depend on `dqrng` (`LinkingTo` or `Imports`). It vendors the same
+  upstream headers (`xoshiro.h`, `pcg_*`, the sitmo threefry impl,
+  `boost.random` Ziggurat) so it can iterate freely.
+- Replace R's RNG via `register_methods()` — out of scope for the
+  experimental phase.
+- Promise CRAN stability. Versioning starts at `0.0.1`; minor
+  releases may break API freely.
+
+## 3. Two canonical shapes for "key material"
+
+The whole R surface uses exactly two shapes for anything that is
+conceptually a fixed-width byte string:
+
+1. **`raw(N)`** — a self-contained binary value (seed, stream
+   selector, generated key).
 2. **`list(kind = character(1), state = raw(N))`** with S3 class
-   `"dqrng_state"` — used wherever a binary value carries a tag
-   identifying *which* RNG produced it.
+   `"dqrng2_state"` — used wherever a binary value carries a tag
+   identifying which RNG produced it.
 
 Nothing else. No bit-packed integer vectors, no decimal-encoded
 character vectors, no `nwords` arithmetic.
 
-## 3. Byte / bit layout (MSB-first)
+## 4. Byte / bit layout (MSB-first)
 
 A `raw(N)` carries an `N*8`-bit unsigned value. Byte 1 is the most
-significant byte; byte `N` is the least significant. This matches
-`writeBin(..., endian = "big")` and matches the existing integer-side
-convention in `dqrng::convert_seed_internal`
-(`inst/include/convert_seed.h`).
+significant byte; byte `N` is the least significant. Matches
+`writeBin(..., endian = "big")`.
 
 Worked example — the value `0x0011223344556677`:
 
@@ -83,20 +96,13 @@ R raw(8):
   bit range:     63.56 55.48 47.40 39.32 31.24 23.16 15.8 7..0
                  ↑ MSB                                     ↑ LSB
 
-Packed uint64_t:
+Packed uint64_t (what the RNG sees internally):
 
   bit position:   63                                              0
                   ▼                                               ▼
                   0x  00   11   22   33   44   55   66   77
                        ↑                                       ↑
                        most significant                        least significant
-
-Legacy integer view (kept only for the deprecation window):
-
-  stream <- c(0x00112233L, 0x44556677L)
-                  │             │
-                  └─ stream[1]  └─ stream[2]
-                     high 32       low 32
 ```
 
 Cross-check:
@@ -107,144 +113,208 @@ writeBin(0x0011223344556677, raw(), size = 8, endian = "big")
 ```
 
 Bytes go in in array order; no host-endianness dependency. We commit
-to big-endian; little-endian is explicitly not supported.
+to big-endian only.
 
-## 4. Target R API
+## 5. Package layout
 
-### 4.1 `dqset.seed()`
-
-```r
-dqset.seed(seed, stream = NULL)
+```
+dqrng2/
+├── DESCRIPTION              # Package: dqrng2; LinkingTo: Rcpp, BH;
+│                            #   no dependence on dqrng
+├── NAMESPACE                # exports dqrng2_*
+├── R/
+│   ├── dqrng2-package.R     # roxygen for the package
+│   ├── set_seed.R           # dqrng2_set_seed()
+│   ├── state.R              # dqrng2_get_state(), dqrng2_set_state()
+│   ├── keys.R               # dqrng2_keys()
+│   ├── kind.R               # dqrng2_kind(), dqrng2_kinds()
+│   ├── distributions.R      # dqrng2_runif/rnorm/rexp/rademacher
+│   ├── sample.R             # dqrng2_sample, dqrng2_sample_int
+│   ├── state-class.R        # S3: dqrng2_state, print, format, ==
+│   └── zzz.R                # .onLoad: seed from R's RNG
+├── src/
+│   ├── dqrng2.cpp           # Rcpp glue, [[Rcpp::interfaces(r, cpp)]]
+│   └── Makevars[.win]       # if needed
+├── inst/include/
+│   ├── dqrng2.h             # umbrella include
+│   ├── dqrng2_types.h       # byte_span, byte_buffer, rng_base
+│   ├── dqrng2_rcpp.h        # Rcpp adapters (kept separate from types)
+│   ├── dqrng2_serde.h       # per-RNG byte layout (header-only)
+│   ├── dqrng2_distribution.h
+│   ├── dqrng2_sample.h
+│   ├── dqrng2_generator.h   # rng_impl<RNG> wrappers
+│   ├── dqrng2_RcppExports.h # generated
+│   └── upstream/            # vendored
+│       ├── xoshiro.h
+│       ├── pcg_random.hpp
+│       ├── pcg_extras.hpp
+│       ├── pcg_uint128.hpp
+│       └── threefry.h       # extracted from sitmo, or LinkingTo: sitmo
+├── tests/testthat/...
+└── plan/                    # this design + porting notes,
+                             # added to .Rbuildignore
 ```
 
-- `seed`: `raw(8)`, `raw(4)`, `NULL` (auto-seed from R's RNG), or a
-  `"dqrng_state"` object (in which case `stream` must be `NULL`;
-  `kind` switches the active RNG and `state` is loaded verbatim).
-- `stream`: `raw(8)`, `raw(4)`, or `NULL`.
+`dqrng2_types.h` has **no `Rcpp` dependency**. That is the single
+biggest leverage over the existing layout: downstream consumers can
+use `dqrng2::rng_base` without dragging Rcpp into their public
+headers if they don't want to.
 
-Length 4 and length 8 are accepted; both pack MSB-first into a
-`uint64_t` (length 4 leaves the high 32 bits zero).
+## 6. R API
 
-Integer input remains accepted for one release with a `lifecycle`
-deprecation warning that points at `as.raw()` / `writeBin()`.
+Public function naming: prefix everything with `dqrng2_`. See §13 for
+the open question on whether to drop the prefix.
 
-Return value: invisibly, the seed actually used as `raw(8)`. Fixes
-the "auto-seed disappears" problem — `s <- dqset.seed(NULL)` lets
-you record the run and replay it.
-
-### 4.2 `dqrng_get_state()` / `dqrng_set_state()`
+### 6.1 Seeding
 
 ```r
-dqrng_get_state()
-#> <dqrng_state: xoroshiro128++>
-#>   kind:  "xoroshiro128++"
-#>   state: raw[16] 7f a3 ...
-
-dqrng_set_state(state)
+dqrng2_set_seed(seed = NULL, stream = NULL)
 ```
 
-Returns / accepts an S3 object:
+- `seed`: one of
+  - `NULL` — draw a fresh seed from R's RNG (no state alteration via
+    `RNGScope`),
+  - `raw(8)` — 64-bit seed, MSB-first,
+  - `raw(4)` — 32-bit seed, zero-padded into the low half of the
+    64-bit value,
+  - a `dqrng2_state` object — sets RNG kind + state in one call;
+    `stream` must be `NULL` in this case.
+- `stream`: `NULL`, `raw(8)`, or `raw(4)`.
+
+Returns invisibly the seed actually used, as `raw(8)`. So
+`saved <- dqrng2_set_seed(NULL)` lets you replay later via
+`dqrng2_set_seed(saved)`.
+
+Wrong-length or wrong-type inputs error with a clear message. No
+silent coercion from integer.
+
+### 6.2 State
+
+```r
+state <- dqrng2_get_state()
+# <dqrng2_state>
+#   kind:   "xoroshiro128++"
+#   state:  raw[21]  7f a3 ... 00
+
+dqrng2_set_state(state)
+```
+
+`state` is an S3 list:
 
 ```r
 structure(
-  list(kind = "xoroshiro128++", state = raw(16)),
-  class = "dqrng_state"
+  list(kind = "xoroshiro128++", state = raw(21)),
+  class = "dqrng2_state"
 )
 ```
 
-`state` is a `raw` vector of RNG-kind-specific length:
+`state` is a `raw` vector of RNG-kind-specific length. The
+`dqrng2_serde.h` header (§7.4) documents the byte layout per RNG:
+the engine's words, big-endian, followed by a 1-byte cache-valid
+flag and a 4-byte cached 32-bit value (`random_64bit_generator`'s
+bit cache must round-trip — see §13).
 
-| Kind | `state` length |
-|---|---|
-| `xoroshiro128+`, `xoroshiro128++`, `xoroshiro128**` | 16 (2 × 64 bits) |
-| `xoshiro256+`, `xoshiro256++`, `xoshiro256**` | 32 (4 × 64 bits) |
-| `pcg64` | 32 (state + stream, both 128-bit) |
-| `threefry` (sitmo 20-round 64-bit) | 64 (key 256 + ctr 256) |
+Approximate sizes:
 
-Plus a one-byte cache flag + four-byte cached value for the 32-bit
-half of the bit-cache in `random_64bit_generator`
-(`inst/include/dqrng_types.h:48-55`) — `state_bytes` advertises this
-per RNG (see §5.3).
+| Kind                       | `state` length |
+|----------------------------|----------------|
+| `xoroshiro128+/++/**`      | 16 + 5 = 21    |
+| `xoshiro256+/++/**`        | 32 + 5 = 37    |
+| `pcg64`                    | 32 + 5 = 37    |
+| `threefry` (20-round 64)   | 64 + 5 = 69    |
 
-`print.dqrng_state`, `format.dqrng_state`, and a stable
-`identical()`-friendly representation come for free with the S3
-class.
+S3 methods: `print`, `format`, `==`, `as.raw` (returns
+`c(charToRaw(kind), as.raw(0), state)` for serialisation as a
+single blob).
 
-### 4.3 Seed pool generation
-
-```r
-dqrng_keys(n = 1L, bytes = 8L)
-```
-
-Returns a `list` of `raw(bytes)` drawn from R's RNG (same source as
-`generateSeedVectors()`, no state alteration via `RNGScope`).
-
-A single key (`n = 1`) returns `list(raw(bytes))` for consistent
-unboxing; or accept a `simplify = FALSE` default with a documented
-`simplify = TRUE` shortcut that returns the bare `raw(bytes)`.
-
-`generateSeedVectors(nseeds, nwords)` becomes a thin deprecated
-wrapper:
+### 6.3 Key generation
 
 ```r
-generateSeedVectors <- function(nseeds, nwords = 2L) {
-  lifecycle::deprecate_warn("0.6.0", "generateSeedVectors()",
-                            "dqrng_keys()")
-  lapply(dqrng_keys(nseeds, bytes = 4L * nwords),
-         raw_to_int_vector)  # exact round-trip of the old output
-}
+keys <- dqrng2_keys(n = 1L, bytes = 8L)
+# list of length n, each element raw(bytes)
 ```
 
-### 4.4 What disappears (deprecated, then removed)
+`bytes` accepts any positive integer; common values 4, 8, 16, 32.
+Replaces `dqrng::generateSeedVectors()`.
 
-- Integer input to `dqset.seed(seed = ..., stream = ...)`.
-- `character`-vector form of `dqrng_get_state()`/`dqrng_set_state()`.
-- `generateSeedVectors()` (replaced by `dqrng_keys()`).
-- The `nwords` parameter (replaced by `bytes`).
+Draws from R's RNG via `RNGScope`, no state alteration.
 
-All of the above remain accepted for one minor release (e.g. `0.5.x`)
-behind `lifecycle::deprecate_warn`, then are removed at `0.6.0`.
+For ergonomics, `n = 1L` still returns a length-1 list (so callers
+can rely on `lapply(keys, ...)` regardless of `n`); add a
+`simplify = FALSE` default with a documented shortcut to unbox.
 
-### 4.5 Convenience helpers
+### 6.4 RNG kind
 
 ```r
-as_dqrng_key(x)        # raw | integer | hex-character → raw(N)
-format(<dqrng_state>)  # hex-encoded one-liner suitable for logs
+dqrng2_kind()                       # returns current "kind" string
+dqrng2_kind(kind = "pcg64")         # sets it
+dqrng2_kinds()                      # returns character vector of valid kinds
 ```
 
-Both are pure R, no C++ work.
+Replaces `dqRNGkind`. Kind names are a fixed enumeration (`dqrng2_kinds()`);
+arbitrary lowercased strings are no longer accepted.
 
-## 5. Target C++ API/ABI — greenfield
+### 6.5 Distributions and sampling
 
-The current C++ surface bakes the integer-packing convention into
-the public ABI (`convert_seed.h`), the state serde into text
-(`random_64bit_generator::output/input`), and the stream/seed
-arguments into `uint64_t` (`dqrng_types.h`). All three pin us to
-the existing R shapes. A clean redesign:
+Same shape as `dqrng`, renamed for prefix consistency:
 
-### 5.1 `dqrng::byte_span`
+```r
+dqrng2_runif(n, min = 0, max = 1)
+dqrng2_rnorm(n, mean = 0, sd = 1)
+dqrng2_rexp(n, rate = 1)
+dqrng2_rademacher(n)
+dqrng2_sample(x, size, replace = FALSE, prob = NULL)
+dqrng2_sample_int(n, size, replace = FALSE, prob = NULL, offset = 0L)
+```
+
+No behavioural change vs `dqrng` — same statistical output bit-for-bit
+given the same seed.
+
+### 6.6 What dqrng2 does *not* export
+
+- `register_methods` / `restore_methods` (out of scope).
+- An integer-input path for seeds. From day one, key material is
+  bytes.
+- A character-vector form of state.
+
+## 7. C++ API
+
+All in namespace `dqrng2`. `// [[Rcpp::interfaces(r, cpp)]]` from day
+one so downstream can use it after a single `LinkingTo: dqrng2`.
+
+### 7.1 `dqrng2::byte_span` / `byte_buffer`
+
+`inst/include/dqrng2_types.h` (no Rcpp):
 
 ```cpp
-// inst/include/dqrng_types.h (new)
-namespace dqrng {
+namespace dqrng2 {
+
 struct byte_span {
   const std::uint8_t* data;
-  std::size_t size;
+  std::size_t         size;
+
+  byte_span() : data(nullptr), size(0) {}
+  byte_span(const std::uint8_t* d, std::size_t n) : data(d), size(n) {}
+  template<std::size_t N>
+  byte_span(const std::uint8_t (&arr)[N]) : data(arr), size(N) {}
 };
-struct byte_buffer {              // owning, for return values
+
+struct byte_buffer {
   std::vector<std::uint8_t> bytes;
   operator byte_span() const { return {bytes.data(), bytes.size()}; }
 };
-}
+
+}  // namespace dqrng2
 ```
 
-C++17, no `std::span` dependency. (Switch to `std::span` when the
-package's minimum C++ standard moves.)
+C++17 baseline; switch to `std::span` when the package's minimum
+standard moves.
 
-### 5.2 `dqrng::rng_base` — abstract base
+### 7.2 `dqrng2::rng_base`
 
 ```cpp
-namespace dqrng {
+namespace dqrng2 {
+
 class rng_base {
 public:
   using result_type = std::uint64_t;
@@ -253,280 +323,315 @@ public:
 
   // metadata
   virtual std::string_view kind() const = 0;
-  virtual std::size_t state_bytes() const = 0;
-  virtual std::size_t seed_bytes() const = 0;     // minimum useful seed width
-  virtual std::size_t stream_bytes() const = 0;   // 0 if no streams
+  virtual std::size_t state_bytes()  const = 0;
+  virtual std::size_t seed_bytes()   const = 0;  // min useful seed width
+  virtual std::size_t stream_bytes() const = 0;  // 0 if no streams
 
   // generation
-  virtual result_type next() = 0;
-  virtual std::uint32_t next_bounded(std::uint32_t) = 0;
-  virtual std::uint64_t next_bounded(std::uint64_t) = 0;
+  virtual result_type   next() = 0;
+  virtual std::uint32_t next_bounded(std::uint32_t range) = 0;
+  virtual std::uint64_t next_bounded(std::uint64_t range) = 0;
 
-  // seeding (all byte-oriented; shorter spans are zero-padded on the
-  // high side, longer spans are rejected)
+  // seeding — byte-oriented; short spans zero-pad on the high side,
+  //                          long spans throw.
   virtual void seed(byte_span seed) = 0;
   virtual void seed(byte_span seed, byte_span stream) = 0;
   virtual std::unique_ptr<rng_base> clone(byte_span stream) const = 0;
 
-  // state serde: caller-allocated, length state_bytes()
+  // state serde; caller-allocated, size == state_bytes()
   virtual void save(std::uint8_t* out) const = 0;
-  virtual void load(const std::uint8_t* in) = 0;
+  virtual void load(const std::uint8_t* in)  = 0;
 
-  // convenience non-virtuals
-  byte_buffer save() const;                       // allocates state_bytes()
-  void seed(std::uint64_t s);                     // adapter to byte_span
+  // ── non-virtual conveniences (no ABI risk) ──────────────────────
+  byte_buffer save() const;                                  // allocates
+  void seed(std::uint64_t s);                                // adapts
   void seed(std::uint64_t s, std::uint64_t st);
+
+  double uniform01();
+  // distribution helpers as non-virtual templates below
+
+  template <typename Dist, typename... A>
+  typename Dist::result_type variate(A&&...);
+  template <typename Dist, typename Range, typename... A>
+  void generate(Range&&, A&&...);
 };
-}
+
+}  // namespace dqrng2
 ```
 
-Drop the `uniform01`, `variate<>`, `generate<>` helpers from the
-*virtual* surface — keep them as non-virtual templates that call
-`next()`. The current `random_64bit_generator` mixes the
-distribution-helper API into the abstract base
-(`inst/include/dqrng_types.h:80-249`); splitting them keeps the
-virtual contract small and the vtable shallow.
+Notes:
 
-Drop the `cache`/`has_cache` members from the base — those are
-implementation details of `random_64bit_wrapper`. Move them down.
+- `cache` / `has_cache` (the bit-cache currently on
+  `random_64bit_generator` in `inst/include/dqrng_types.h:48-55`)
+  move **down** into `rng_impl`. The abstract base is byte-pure.
+- `operator<<` / `operator>>` are gone. State is bytes.
+- The variate/generate helpers are non-virtual templates — no vtable
+  slot, no ABI cost.
 
-Drop `operator<<` / `operator>>`. State I/O is `save`/`load` over
-bytes.
+### 7.3 `rng_impl<RNG>` — concrete wrappers
 
-### 5.3 Per-RNG concrete wrappers
+`inst/include/dqrng2_generator.h`:
 
 ```cpp
 template<typename RNG>
 class rng_impl : public rng_base {
-  RNG gen;
-  std::uint8_t cache_valid{0};
+  RNG           gen;
+  std::uint8_t  cache_valid{0};
   std::uint32_t cache{0};
 
 public:
-  static constexpr std::string_view kind_v = ...;     // per specialisation
+  static constexpr std::string_view kind_v = ...;  // per specialisation
   std::string_view kind() const override { return kind_v; }
-  std::size_t state_bytes() const override {
-    return sizeof(RNG::state) + 1 /*cache_valid*/ + 4 /*cache*/;
-  }
-  void save(std::uint8_t* out) const override { ... };   // RNG-specific
-  void load(const std::uint8_t* in) override { ... };
-  ...
+  std::size_t state_bytes()  const override { return state_layout<RNG>::bytes; }
+  std::size_t seed_bytes()   const override { return 8; }
+  std::size_t stream_bytes() const override { return stream_layout<RNG>::bytes; }
+
+  result_type next() override { return gen(); }
+
+  void seed(byte_span s) override;
+  void seed(byte_span s, byte_span st) override;
+  std::unique_ptr<rng_base> clone(byte_span st) const override;
+
+  void save(std::uint8_t* out) const override;   // dqrng2_serde.h does the work
+  void load(const std::uint8_t* in)  override;
 };
 ```
 
-Each RNG gets a *byte-exact* serialisation; the layout is documented
-per RNG (table in §4.2) and is the same on every platform (the words
-are written big-endian regardless of host endianness — single
-serialiser does the byte swap).
+Per-RNG specialisations live in `dqrng2_serde.h` and are the only
+RNG-specific code outside the upstream headers themselves.
 
 PCG64 stream semantics: drop the "relative to current stream"
-behaviour (`inst/include/dqrng_generator.h:104-117`) — make
-`seed(seed, stream)` set the absolute stream like every other RNG.
-Same arg name should mean the same thing. The current behaviour
-becomes a separate `nudge_stream(byte_span)` method on `rng_impl<pcg64>`
-for callers who depended on it.
+behaviour (which `dqrng` does at
+`inst/include/dqrng_generator.h:104-117`). In `dqrng2`,
+`seed(seed, stream)` sets the absolute stream like every other RNG.
+The old behaviour, if anyone needs it, becomes a separate
+`nudge_stream(byte_span)` method on `rng_impl<pcg64>`. Same arg name
+should mean the same thing.
 
-### 5.4 Rcpp adapter layer — `dqrng_rcpp.h` (new)
+### 7.4 `dqrng2_serde.h` — byte layouts
 
-`dqrng_types.h` and `convert_seed.h` lose all their `Rcpp::...`
-dependencies. A new header `inst/include/dqrng_rcpp.h` holds the
-glue:
+One header documents and implements, per RNG, the on-disk-equivalent
+byte layout:
 
 ```cpp
-namespace dqrng { namespace rcpp {
+namespace dqrng2 { namespace serde {
 
-inline byte_span as_byte_span(SEXP x);     // RAWSXP only; throws otherwise
-inline byte_buffer as_byte_buffer(SEXP x); // same, owning copy
-inline Rcpp::RawVector to_raw(byte_span);
-inline Rcpp::RawVector to_raw(std::uint64_t);
+template<typename RNG> struct layout;
+// e.g.
+template<> struct layout<::dqrng2::xoroshiro128plusplus> {
+  static constexpr std::size_t bytes = 16;
+  // big-endian write of two uint64_t words s[0], s[1]
+  static void save(const ::dqrng2::xoroshiro128plusplus&, std::uint8_t*);
+  static void load(::dqrng2::xoroshiro128plusplus&, const std::uint8_t*);
+};
+// ... same for the other RNGs
 
-// dqrng_state list <-> { kind, byte_span }
+// Common 5-byte suffix for the bit cache:
+inline void save_cache(std::uint8_t valid, std::uint32_t cache,
+                       std::uint8_t* out);
+inline void load_cache(std::uint8_t& valid, std::uint32_t& cache,
+                       const std::uint8_t* in);
+
+}}  // namespace dqrng2::serde
+```
+
+This is the entire RNG-specific surface for state serialisation, in
+one file. Reviewers can audit the byte layout of every RNG by
+reading a single screen of code.
+
+### 7.5 `dqrng2_rcpp.h` — Rcpp adapters
+
+This header is the **only** place `Rcpp::` appears in the C++ public
+surface. `dqrng2_types.h` stays Rcpp-free.
+
+```cpp
+namespace dqrng2 { namespace rcpp {
+
+byte_span    as_byte_span(SEXP x);              // RAWSXP only
+byte_buffer  as_byte_buffer(SEXP x);            // RAWSXP only, owning copy
+Rcpp::RawVector to_raw(byte_span);
+Rcpp::RawVector to_raw(std::uint64_t);
+
+// dqrng2_state list <-> { kind, byte_span }
 struct state_view { std::string_view kind; byte_span state; };
-inline state_view as_state(Rcpp::List);
-inline Rcpp::List  to_state(std::string_view kind, byte_span state);
+state_view   as_state(Rcpp::List);
+Rcpp::List   to_state(std::string_view kind, byte_span state);
 
-}}
+}}  // namespace dqrng2::rcpp
 ```
 
-`src/dqrng.cpp` becomes a thin Rcpp shell:
+### 7.6 `src/dqrng2.cpp` — exports
+
+A thin Rcpp shell. Every C++ export is byte-oriented:
 
 ```cpp
 // [[Rcpp::export(rng = false)]]
-Rcpp::RawVector dqset_seed(Rcpp::Nullable<Rcpp::RawVector> seed,
-                           Rcpp::Nullable<Rcpp::RawVector> stream) {
-  // returns the seed actually used
-  ...
-}
+Rcpp::RawVector dqrng2_set_seed_impl(Rcpp::Nullable<Rcpp::RawVector> seed,
+                                     Rcpp::Nullable<Rcpp::RawVector> stream);
 
 // [[Rcpp::export(rng = false)]]
-Rcpp::List dqrng_get_state() {
-  return dqrng::rcpp::to_state(rng->kind(), rng->save());
-}
+Rcpp::List dqrng2_get_state_impl();
 
 // [[Rcpp::export(rng = false)]]
-void dqrng_set_state(Rcpp::List state) {
-  auto v = dqrng::rcpp::as_state(state);
-  dqRNGkind_impl(std::string(v.kind));
-  rng->load(v.state.data);
-}
+void dqrng2_set_state_impl(Rcpp::List state);
+
+// [[Rcpp::export(rng = true)]]
+Rcpp::List dqrng2_keys_impl(int n, int bytes);
+
+// [[Rcpp::export(rng = false)]]
+Rcpp::NumericVector dqrng2_runif_impl(R_xlen_t n, double min, double max);
+// ... etc.
 ```
 
-### 5.5 What disappears from the C++ API
+R wrappers in `R/` provide the public surface from §6 and do the
+type checking before calling into C++.
 
-- `dqrng::convert_seed<T>(...)` — replaced by `byte_span` everywhere.
-  Header-only `convert_seed.h` is kept as a deprecation shim for one
-  release; it `#warning`s on include and forwards to the new path.
-- `random_64bit_generator::output(std::ostream&)` and `input`.
-- `operator<<` / `operator>>` on the base.
-- The `cache`/`has_cache` members on the base (moved to `rng_impl`).
-- `dqrng::rng64_t` typedef (kept as alias to the new `rng_ptr` for
-  one release).
-- `random_64bit_accessor`'s text I/O (moved to byte I/O).
+## 8. Vendored upstream code
 
-### 5.6 What stays
+`dqrng` vendors:
+- `external/pcg-cpp` (PCG headers),
+- `external/xoroshiro128plus-cpp`, `external/xorshift-cpp` (Vigna originals),
+- `inst/include/xoshiro.h` (dqrng's own wrapper around Vigna's code),
+- Threefry via `LinkingTo: sitmo`.
 
-- The set of supported RNGs and their statistical properties.
-- The `next()` contract (`uint64_t`, full range, period as before).
-- `dqrng.h` as the public top-level include (its contents are
-  rewritten to forward to the new headers).
+`dqrng2` makes the same choice as `dqrng` did: vendor or `LinkingTo`
+the same upstream sources, isolated under `inst/include/upstream/`.
+No new statistical code; only the wrapper layer is new.
 
-## 6. Migration plan
+License/copyright lines preserved per upstream; `LICENSE.note`
+mirrors `dqrng`'s.
 
-**Phase 1 — Additive (no C++ ABI break).** Ship in `0.5.0`:
+## 9. Interop with dqrng (optional, useful)
 
-- `RawVector` overload of `dqrng::convert_seed<T>` (free function;
-  pure addition to `convert_seed.h`).
-- New `dqset_seed_raw` Rcpp export alongside the existing
-  `dqset_seed`, so the `validateSignature` string in
-  `inst/include/dqrng_RcppExports.h` for `dqset_seed` is unchanged.
-  R-side `dqset.seed()` dispatches on `is.raw(...)`.
-- `dqrng_keys(n, bytes)` new export; `generateSeedVectors()`
-  unchanged.
-- `dqrng_get_state_raw()` / `dqrng_set_state_raw()` new exports.
-  Their internal implementation switches on `rng_kind` and downcasts
-  the `Rcpp::XPtr<random_64bit_generator>` to the concrete
-  `random_64bit_wrapper<RNG>*` to read/write the bytes — no new
-  virtuals on the base.
-- `dqrng_state` S3 class lives entirely in R.
-- All new functions documented; old functions get a "see also"
-  pointer but no deprecation warning yet.
+While both packages can coexist (separate namespaces, separate
+global RNG states), interop is a small, useful surface to ship:
 
-After Phase 1 the user-visible API has the consistent shapes from
-§4; the old shapes are still accepted; no downstream package needs
-a rebuild.
+```r
+dqrng2_from_dqrng()   # copy dqrng's current state into dqrng2's
+dqrng2_to_dqrng()     # the reverse
+```
 
-**Phase 2 — ABI break (`0.6.0`, major bump).** Implements §5 in
-full:
+Implementation: get/set state on each side via the public R API of
+each package. `dqrng`'s state is a `character` vector; `dqrng2`'s is
+`dqrng2_state`. The translation table (one entry per RNG kind) is a
+~50-line R function that parses the decimal words from `dqrng` and
+packs them MSB-first into the `state` raw. No C++ work.
 
-- New `dqrng::rng_base` replaces `random_64bit_generator`.
-- New `dqrng_rcpp.h`, byte-oriented `save`/`load`.
-- Old `random_64bit_generator`, `convert_seed.h`,
-  `generateSeedVectors`, integer input to `dqset.seed`, and
-  character form of `dqrng_get_state`/`set_state` are
-  removed (or kept as `#warning`-emitting shims that forward).
-- Downstream packages must rebuild and update against the new
-  abstract base. The migration is mechanical:
-  - `convert_seed<uint64_t>(ivec)` → seed directly from a
-    `byte_span` (or use `dqrng::rcpp::as_byte_span`).
-  - `gen->seed(s, st)` (numeric) → either still works via the
-    non-virtual `seed(uint64_t,uint64_t)` adapter, or switch to
-    the byte-span virtual.
-  - `gen->output(os)` → `gen->save(buf)` then handle bytes.
-- `NEWS.md` includes a porting checklist with `before` / `after`
-  snippets for each removed symbol.
+This makes the porting story concrete: a user who is mid-pipeline on
+`dqrng` can hop to `dqrng2` (or vice versa) without losing
+reproducibility.
 
-**Phase 2 prerequisites.** Reverse-dependency check (`revdepcheck::`)
-across CRAN reverse imports of `dqrng` to size the migration impact;
-publish a porting guide before tagging `0.6.0`.
-
-## 7. Work breakdown
-
-### Phase 1 (single PR, no ABI break)
-
-1. `RawVector` overload + `as_uint64_seed(SEXP)` helper in
-   `inst/include/convert_seed.h`. Tests in
-   `tests/testthat/cpp/convert.cpp`.
-2. `dqset_seed_raw` Rcpp export in `src/dqrng.cpp`. Verify the
-   pre-existing `dqset_seed` signature string in
-   `inst/include/dqrng_RcppExports.h` is byte-identical after
-   `Rcpp::compileAttributes()`.
-3. R `dqset.seed()` dispatches on input type; returns the seed used
-   invisibly as `raw(8)`.
-4. `dqrng_keys(n, bytes)` Rcpp export; `dqrng_state` S3 class +
-   `print.dqrng_state` in R.
-5. `dqrng_get_state_raw()` / `dqrng_set_state_raw()` Rcpp exports
-   with kind-switched downcast. Per-RNG byte serialisation
-   documented in `inst/include/dqrng_serde.h` (new header,
-   header-only).
-6. R wrappers: `dqrng_get_state()` and `dqrng_set_state()` are
-   re-exposed as raw-state-returning functions; the old
-   character-vector entry points are renamed
-   `dqrng_get_state_text()` / `dqrng_set_state_text()` and kept
-   exported for one release.
-7. NEWS.md, man pages, `air` format pass.
-
-### Phase 2 (major version)
-
-8. Introduce `dqrng::byte_span` / `byte_buffer` in
-   `inst/include/dqrng_types.h`.
-9. Add `dqrng::rng_base` alongside the old
-   `random_64bit_generator`. Implement `rng_impl<RNG>` for all
-   supported RNGs with byte-exact `save`/`load` and dispatch through
-   `byte_span` everywhere.
-10. New `inst/include/dqrng_rcpp.h`; `src/dqrng.cpp` rewritten to
-    use it.
-11. Deprecate `convert_seed.h`, `random_64bit_generator`,
-    `dqrng::rng64_t`, `generateSeedVectors`, integer input to
-    `dqset.seed`, character-form state. Each emits a
-    `lifecycle::deprecate_warn` / `#warning` on use.
-12. Reverse-dependency check; porting guide; `0.6.0` release.
-
-## 8. Tests
+## 10. Tests
 
 In `tests/testthat/`:
 
-- `test-raw-roundtrip.R`: every accepted shape of `seed` / `stream`
-  produces the same `dqrunif(100)` output as the canonical `raw(8)`
-  form. Lengths 4 and 8 covered; bad lengths error.
-- `test-state-roundtrip.R`: for every supported RNG kind, draw
-  → `dqrng_get_state()` → consume → `dqrng_set_state(saved)` →
-  draw matches. Compare against the text-form round-trip for
-  byte parity during the deprecation window.
-- `test-dqrng-keys.R`: `dqrng_keys(n, bytes)` returns a list of
-  `raw(bytes)` of length `n`, `bytes ∈ {4, 8, 16, 32}` smoke-tested;
-  using a key from `dqrng_keys()` as `stream` produces the
-  documented behaviour.
-- `test-deprecation.R`: each deprecated entry point emits the
-  expected `lifecycle` warning under
-  `withr::local_options(lifecycle_verbosity = "warning")`.
-- C++ tests in `tests/testthat/cpp/convert.cpp`: parity between
-  the integer and raw paths of `convert_seed` (Phase 1) and the
-  `byte_span` API (Phase 2).
-- Generator-suite tests (`tests/testthat/test-generators.R`)
-  parameterised over the canonical raw form.
+- `test-set-seed.R`: every accepted shape of `seed` / `stream`
+  produces the same `dqrng2_runif(100)` output as the canonical
+  `raw(8)` form. Length 4 and 8; bad lengths error; bad types
+  error.
+- `test-state-roundtrip.R`: for every supported RNG kind:
+  - draw → `dqrng2_get_state()` → consume → `dqrng2_set_state(saved)` →
+    draw matches;
+  - identity holds across serialisation to / from bytes (`as.raw`
+    on the state, then back).
+- `test-keys.R`: `dqrng2_keys(n, bytes)` returns `n` elements of
+  exactly `bytes` bytes each; `n = 0` returns `list()`.
+- `test-replay.R`: `s <- dqrng2_set_seed(NULL); x <- dqrng2_runif(100);
+  dqrng2_set_seed(s); y <- dqrng2_runif(100); expect_identical(x, y)`.
+- `test-interop.R` (if §9 lands): for every RNG kind, draw from
+  `dqrng`, `dqrng2_from_dqrng()`, continue drawing, and compare
+  against `dqrng`'s continuation.
+- `tests/testthat/cpp/serde.cpp`: round-trip every RNG's
+  `save`/`load` against a hand-encoded byte pattern. Lock the byte
+  layout in.
+- `tests/testthat/cpp/byte_span.cpp`: `dqrng2::byte_span` and
+  `dqrng2::rcpp::as_byte_span` smoke tests.
+- Generator-suite tests parameterised over all RNG kinds (mirror
+  `dqrng/tests/testthat/test-generators.R`).
 
-## 9. Out of scope
+## 11. Porting back to `dqrng` — issue-sized chunks
+
+`dqrng2` is the proving ground; `dqrng` adopts at its own pace. Each
+of the following is a self-contained PR that does **not** require
+the others to land. Each is small enough to review on a coffee
+break.
+
+| # | Idea | `dqrng` change | ABI impact |
+|---|---|---|---|
+| 1 | Accept `raw(4|8)` for `seed` / `stream` | New `dqset_seed_raw` Rcpp export; R-side dispatch in `dqset.seed()` | Additive |
+| 2 | Return seed used from `dqset.seed(NULL)` | R-only change; returns `raw(8)` invisibly. Old code that ignores the return value is unaffected | None |
+| 3 | `dqrng_keys(n, bytes)` | New Rcpp export returning `list<raw>`; old `generateSeedVectors` kept | Additive |
+| 4 | `dqrng_state` S3 class for `dqrng_get_state` / `set_state` | New `dqrng_get_state_raw` / `dqrng_set_state_raw` exports via kind-switched downcast; R-level S3 class; old character form kept | Additive |
+| 5 | `dqrng_kinds()` enumerator | R-only; reads from a small table | None |
+| 6 | PCG64 stream semantics change | Behavioural break; needs a behind-an-option toggle or major bump | Behaviour |
+| 7 | Byte-oriented `seed` / `clone` virtuals on the C++ base | Breaks `dqrng_types.h` ABI; major bump | C++ ABI |
+| 8 | Drop `dqrng::convert_seed<T>` packing | After (1) and (7) land; major bump | C++ ABI |
+
+Items 1–5 are mergeable into `dqrng` today (additive). Items 6–8 are
+the bigger steps; the maintainer takes them when ready, and `dqrng2`
+has been running on that design for long enough to know it works.
+
+Each item gets a tracking issue in `daqana/dqrng` with the dqrng2
+PR / commit as a reference implementation.
+
+## 12. Roadmap
+
+| Milestone | Contents | Rough sequence |
+|---|---|---|
+| `dqrng2 0.0.1` | RNGs + distributions + raw seed/stream + `dqrng2_get_state`/`set_state` + S3 class + tests; no interop yet | 1 |
+| `dqrng2 0.0.2` | `dqrng2_keys`, replay (`dqrng2_set_seed(NULL)` returns seed), bounded sampling | 2 |
+| `dqrng2 0.0.3` | Interop with `dqrng` (§9) | 3 |
+| `dqrng → ...` | Porting PRs 1–5 from §11, in any order the maintainer accepts | 4+ |
+| `dqrng2 0.1.0` | API freeze candidate after a CRAN reverse-dep equivalent (run dqrng's revdeps against `dqrng2_*` translation shims) | when stable |
+| `dqrng` major | Items 6–8 from §11; coordinated with `dqrng2 0.1.0` | when maintainer ready |
+
+`dqrng2` does not have to be retired even after `dqrng` adopts
+everything — it can stay as a canary track for future experiments.
+
+## 13. Open questions
+
+- **Function naming.** `dqrng2_set_seed` (prefixed, discoverable
+  globally) vs `set_seed` (clean inside `library(dqrng2)`, but
+  collides with `base::set.seed` only in spirit, not by name). Lean
+  prefixed for safety. Decide before `0.0.1`.
+- **Visibility of the seed return value.** Visible would be more
+  discoverable (`dqrng2_set_seed(NULL)` prints a `raw(8)`); invisible
+  matches `base::set.seed`'s vibe. Lean invisible.
+- **Bit-cache.** `dqrng::random_64bit_generator::cache` /
+  `has_cache` is part of the user-visible output stream. Confirm
+  the 5-byte suffix (1 valid flag + 4 cached bits) round-trips
+  faithfully through `dqrng2_get_state` / `set_state` for every RNG.
+  Hand-write a regression in `tests/testthat/cpp/serde.cpp` for the
+  case "consume 32 bits, get_state, set_state, continue, compare".
+- **Threefry source.** Inline the relevant headers from `sitmo` or
+  keep `LinkingTo: sitmo`? `LinkingTo` is smaller surface but pins us
+  to sitmo's release cadence. Lean `LinkingTo`, match `dqrng`'s
+  current choice.
+- **`dqrng2_kinds()` vocabulary.** Include the legacy "+" variants
+  (`xoroshiro128+`, `xoshiro256+`) for parity with `dqrng`? Yes:
+  parity matters more than aesthetic cleanup at this stage. Document
+  the recommendation to prefer "++"/"**".
+- **License.** AGPL-3 to match `dqrng`. Same copyright owners for
+  the vendored RNG code.
+
+## 14. Out of scope
 
 - LSB-first / `endian = "little"` flag. We commit to MSB-first.
-- Multi-byte stream IDs > 8 bytes (PCG64's 128-bit stream selector,
-  xoshiro256's 256-bit jump). Phase 2's `byte_span` API makes this
-  cheap to add later — track as a Phase 3 follow-up.
-- Replacing R's RNG entirely (`register_methods()` already exists
-  for that and is orthogonal).
-- A binary on-disk state file format. The `raw(N)` state from
-  `dqrng_get_state()` is already a byte string; users can write it
-  with `saveRDS()` or `writeBin()`.
+- Multi-byte stream IDs > 8 bytes (PCG64's 128-bit selector,
+  xoshiro256's 256-bit jump state). `byte_span` makes this trivial
+  to add later; not for `0.0.1`.
+- Replacing R's RNG via `register_methods()`. Orthogonal feature.
+- A wire format / on-disk file format. `as.raw(<dqrng2_state>)` is
+  already a byte string; `saveRDS()` / `writeBin()` cover storage.
 
-## 10. Open questions
+## 15. Repository plan
 
-- `dqrng_keys()` vs `dqrng_seeds()` vs `dqrng_generate()` — pick one
-  name. `dqrng_keys()` is short and reads well in
-  `lapply(dqrng_keys(8), ...)`. Decide before Phase 1 ships.
-- Should `dqset.seed(NULL)` return the seed used visibly or
-  invisibly? Visibly is more discoverable; invisibly is closer to
-  `base::set.seed()`. Lean invisible + document.
-- The "cache" half of `random_64bit_generator` (one valid-bit + 32
-  cached bits, `dqrng_types.h:48-55`) is part of the user-visible
-  RNG output stream and must be in `state`. Confirm we capture this
-  correctly in Phase 1's downcast-based serde before Phase 2 inherits
-  the implementation.
+`dqrng2` lives in its own repo (`krlmlr/dqrng2` or under a neutral
+org). Initial commit is the package skeleton plus this plan
+(`plan/dqrng2.md`, build-ignored). First milestone (`0.0.1`) is
+tagged from a single PR.
+
+In the `dqrng` repo (this one), keep the plan at `plan/raw.md` as a
+pointer: short paragraph explaining the dqrng2 approach + link to
+the dqrng2 repo + the porting checklist from §11 reproduced as a
+GitHub project board.
